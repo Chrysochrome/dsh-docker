@@ -66,6 +66,22 @@ COPY --from=builder /src /app
 
 WORKDIR /app
 
+# Opt-in Docker bridge listener. CLI --host rejects 0.0.0.0, but the
+# webserver supports it through the upstream configuration patch interface.
+RUN <<'EOF'
+cat > /app/docker-web.patch.yml <<'YAML'
+- id: webserver
+  name: '@deepseek-ai/dsh-host-webserver'
+  inject: [webStartup]
+  config:
+    host: '0.0.0.0'
+    port: !!js ctx.webStartup.port ?? 3080
+    compression: gzip
+    compressionLevel: 1
+    compressionThresholdBytes: 1024
+YAML
+EOF
+
 # DSH_HOME is dsh's state root (credentials, profiles, settings, sessions,
 # attachments). It defaults to ~/.dsh; here it is /data, declared as a volume so
 # you can bind-mount a host directory onto it.

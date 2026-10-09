@@ -142,15 +142,22 @@ jobs:
           echo "::endgroup::"
 
           # Match the deployed read-only filesystem and restricted permissions.
-          for layout in normal hardened; do
+          for layout in normal hardened nas-bridge; do
             echo "::group::boot layout: ${layout}"
             tmp_flags=()
-            if [ "$layout" = "hardened" ]; then
+            network_flags=(--network host)
+            app_args=()
+            if [ "$layout" != "normal" ]; then
               tmp_flags=(--read-only --tmpfs /tmp:rw,noexec,nosuid,nodev,size=1g
                 --security-opt no-new-privileges:true --cap-drop ALL)
             fi
-            docker run -d --name dsh-smoke --network host "${tmp_flags[@]}" \
-              -e DSH_HOME=/tmp/dsh-home "$image"
+            if [ "$layout" = "nas-bridge" ]; then
+              network_flags=(-p 127.0.0.1:3080:3080)
+              app_args=(web --no-open --patch /app/docker-web.patch.yml
+                --trusted-host 127.0.0.1:3080)
+            fi
+            docker run -d --name dsh-smoke "${network_flags[@]}" "${tmp_flags[@]}" \
+              -e DSH_HOME=/tmp/dsh-home "$image" "${app_args[@]}"
             cleanup() {
               echo "::group::container logs"
               docker logs dsh-smoke 2>&1 || true
