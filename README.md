@@ -22,17 +22,45 @@ Web 服务只监听容器内 loopback（上游禁止 `--host 0.0.0.0`），所�
 ```sh
 docker run --rm --network host \
   -e DEEPSEEK_API_KEY=sk-... \
-  -v dsh-home:/data \
+  -e DSH_HOME=/data \
+  -v /your/host/dsh-home:/data \
+  -v /your/host/projects:/workspace \
   ghcr.io/<owner>/dsh-docker
 ```
 
 然后浏览器打开启动日志里打印的 `dsh web:` URL。
 
-覆盖参数（启动器自带 flag 之后的参数会透传给 web app）：
+> `docker run` 里的 `web` 是 `--profile web` 的官方简写；默认端口 **3080**。
+> 想换端口就整体覆盖默认命令：`... dsh-docker web --no-open --port 8080`
+> （同时 `-e DSH_PORT=8080`，否则容器 `HEALTHCHECK` 会一直探 3080、显示 unhealthy）。
 
-```sh
-docker run --rm --network host ghcr.io/<owner>/dsh-docker web --no-open --port 8080
-```
+### dsh-home 与 workspace 是两码事，都可以放到容器外面
+
+dsh 区分两个目录，各自都可以用 bind mount 映射到宿主机路径：
+
+| | 是什么 | 怎么定义在「外面」 |
+|---|---|---|
+| **dsh-home**（`DSH_HOME`） | harness 的状态根：`.credentials.yaml`、`profiles/`、设置、会话、附件等 | `-e DSH_HOME=/data -v /your/host/dsh-home:/data`。解析优先级：显式配置 > `$DSH_HOME` > `~/.dsh` |
+| **workspace** | agent 实际读写代码的目录，跟 dsh-home 完全分开 | 把宿主机目录 bind 进容器（`-v /your/host/projects:/workspace`），再在 Web UI 里「添加 workspace」选 `/workspace` |
+
+> 注意两点：
+> 1. 进程固定从 `/app` 启动（`tsx` 需要从 `/app/node_modules` 解析），所以**不要**用 `-w` 改工作目录，workspace 请在 Web UI 里添加。
+> 2. 新开的 Web UI 默认没有任何 workspace，必须先手动加一个。
+
+## CI 自检（Smoke test）
+
+每次构建（定时 / 手动 / push）之后，workflow 都会自动**起一次容器**验证运行时，
+不需要你本地有 docker：
+
+1. `dsh web --help` — 验证镜像能启动、`tsx` 能从 `/app/node_modules` 正确解析、
+   CLI 与 web 插件能加载（`--help` 只打印帮助、不真正 bind）。
+2. 分离模式启动 `web --no-open`，轮询日志等待上游文档定义的 readiness 信号
+   `dsh web:` 行出现（最多 ~5 分钟）。
+3. `curl http://127.0.0.1:3080/`，只要不是 `000`（连不上）就算通过——
+   启动 URL 带进程 token，所以 401/403 也算端口正常。
+4. 无论成败都会把容器日志打进 workflow，失败时直接能看见原因。
+
+手动跑一次 `workflow_dispatch`、把 `push_image` 取消勾选，就是「只构建 + 自检、不推包」。
 
 ## 已知限制 / 后续可优化
 
@@ -41,3 +69,22 @@ docker run --rm --network host ghcr.io/<owner>/dsh-docker web --no-open --port 8
 - 只监听 loopback：跨机访问需要 `--network host`，或在同 netns 里放反向代理 +
   `--trusted-host`。
 - 定时任务在仓库 60 天无活动后会被 GitHub 自动停用；可加一个 keep-alive。
+
+## 保留策略（只留最近一周）
+
+每次推送镜像后，workflow 会跑一步清理，**删除 7 天前的所有镜像版本**，
+只保留最近一周的构建，避免 Packages 容量无限增长。
+
+- 由 [`dataaxiom/ghcr-cleanup-action`](https://github.com/dataaxiom/ghcr-cleanup-action) 完成，
+  规则是 `older-than: 7 days` + `delete-tags: '*'`。
+- 注意 `older-than` 的语义是「把**所有**规则限制在比该时长更老的镜像上」，
+  所以这是「删掉 7 天前的」，**不是**「保留最老的 N 个」——这两个方向很容易搞反。
+- `latest` 被 `exclude-tags` 保护，任何时候都至少留一个可用镜像。
+- 只在**真正推送了镜像**时才执行（手动 build-only 测试不会触发清理）。
+- 顺带清掉残留的 untagged manifest（platform / attestation）和父镜像已消失的 referrer。
+
+调整保留窗口就改 `build.yml` 里 `older-than` 的值（支持 `days` / `weeks` / `months` / `years`）。
+
+> ⚠️ 用 `GITHUB_TOKEN` 删包版本，需要该 package 给本仓库 **Admin** 权限：
+> 仓库 → Packages → 选中该包 → Package settings → Manage Actions access → 给本仓库 Admin。
+> 否则清理步骤会 403。

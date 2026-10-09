@@ -101,6 +101,10 @@ jobs:
           file: ./Dockerfile
           # Schedule / push: always publish. Manual run: only if push_image is checked.
           push: ${{ github.event_name != 'workflow_dispatch' || inputs.push_image }}
+          # Load into the local docker daemon only when we did NOT push, so the
+          # smoke test below has an image to run. (`load` and `push` are
+          # mutually exclusive in buildx.)
+          load: ${{ github.event_name == 'workflow_dispatch' && !inputs.push_image }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
@@ -108,3 +112,73 @@ jobs:
             DSH_REF=${{ steps.upstream.outputs.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      # Verify the built image actually boots, so entrypoint / tsx-resolution
+      # regressions surface here instead of on your machine. Uses `--network
+      # host` because dsh refuses to bind a non-loopback host.
+      - name: Smoke test (boot + HTTP)
+        run: |
+          set -euo pipefail
+          image="${{ steps.image.outputs.name }}:latest"
+
+          # When we pushed, the image is in the registry, not local: pull it.
+          if [ "${{ github.event_name != 'workflow_dispatch' || inputs.push_image }}" = "true" ]; then
+            docker pull "$image"
+          fi
+
+          echo "::group::dsh web --help"
+          docker run --rm "$image" web --help
+          echo "::endgroup::"
+
+          docker run -d --name dsh-smoke --network host \
+            -e DSH_HOME=/tmp/dsh-home "$image"
+          cleanup() {
+            echo "::group::container logs"
+            docker logs dsh-smoke 2>&1 || true
+            echo "::endgroup::"
+            docker rm -f dsh-smoke >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+
+          # The documented readiness signal is the `dsh web:` URL line.
+          ready=""
+          for i in $(seq 1 60); do
+            if docker logs dsh-smoke 2>&1 | grep -q 'dsh web:'; then
+              ready=1; echo "readiness line after ~$((i * 5))s"; break
+            fi
+            running="$(docker inspect -f '{{.State.Running}}' dsh-smoke 2>/dev/null || echo false)"
+            if [ "$running" != "true" ]; then
+              echo "container exited before becoming ready"; break
+            fi
+            sleep 5
+          done
+          [ -n "$ready" ] || { echo "::error::web server never reported readiness"; exit 1; }
+
+          # Prove the listener is reachable. Any HTTP status counts; the startup
+          # URL carries a token, so 401/403 still means the port is open.
+          code="$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:3080/ || true)"
+          echo "GET http://127.0.0.1:3080/ -> ${code}"
+          [ "$code" != "000" ] || { echo "::error::nothing listening on 3080"; exit 1; }
+
+      # Retention: drop everything older than a week so the registry does not
+      # grow without bound. Only runs when an image was actually pushed, so
+      # build-only manual test runs leave Packages untouched.
+      #
+      # Note the action's semantics: `older-than` scopes *every* rule to images
+      # older than the interval. So this is "delete all tags of images older
+      # than 7 days" (NOT "keep the newest N older images"). `latest` is
+      # excluded so a usable image always survives.
+      - name: Prune image versions older than a week
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.push_image }}
+        uses: dataaxiom/ghcr-cleanup-action@v1
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          owner: ${{ github.repository_owner }}
+          package: ${{ github.event.repository.name }}
+          older-than: 7 days
+          delete-tags: '*'
+          exclude-tags: latest
+          # Also sweep leftover untagged manifests (platform/attestation blobs)
+          # and referrers whose parent image is already gone.
+          delete-untagged: true
+          delete-orphaned-images: true

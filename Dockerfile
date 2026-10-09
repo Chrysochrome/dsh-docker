@@ -5,7 +5,7 @@
 # image that boots the Web profile.
 #
 #   docker build -t dsh-docker --build-arg DSH_REF=<branch|tag|sha> .
-#   docker run --rm --network host -v dsh-home:/data ghcr.io/<owner>/dsh-docker
+#   docker run --rm --network host -v "$PWD/dsh-home:/data" -v "$PWD/projects:/workspace" ghcr.io/<owner>/dsh-docker
 
 # ---------------------------------------------------------------------------
 # Stage 1 — builder
@@ -56,12 +56,29 @@ COPY --from=builder /src /app
 
 WORKDIR /app
 
+# DSH_HOME is dsh's state root (credentials, profiles, settings, sessions,
+# attachments). It defaults to ~/.dsh; here it is /data, declared as a volume so
+# you can bind-mount a host directory onto it.
 ENV DSH_HOME=/data
-RUN mkdir -p /data
+# The agent *workspace* is separate from DSH_HOME and is chosen in the Web UI.
+# Bind-mount one in (e.g. -v /host/projects:/workspace) and add it in the UI.
+# Keep the process rooted at /app so `tsx` resolves from /app/node_modules.
+RUN mkdir -p /data /workspace
 VOLUME ["/data"]
 
-# Loopback-only listener inside the container; use `--network host` to reach it.
+# The web listener always binds loopback inside the container (dsh rejects
+# `--host 0.0.0.0`), on port 3080 by default. Publish it with `--network host`;
+# plain `-p 3080:3080` will NOT work, because docker forwards to the container's
+# eth0 address, not its loopback.
 EXPOSE 3080
 
-ENTRYPOINT ["tini", "--", "node", "--import", "tsx/esm", "apps/cli/src/bin.ts"]
+# Readiness probe. Any HTTP response means "up" — the startup URL carries a
+# process token, so a 401/403 is still a healthy listener. If you launch with a
+# non-default `--port`, export DSH_PORT to match so the probe keeps working.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=90s --retries=3 \
+  CMD node -e "fetch('http://127.0.0.1:'+(process.env.DSH_PORT||3080)+'/').then(()=>process.exit(0)).catch(()=>process.exit(1))"
+
+# `web` is the documented shorthand for `--profile web`; `--no-open` skips the
+# browser handoff (there is none in a container).
+ENTRYPOINT ["tini", "--", "node", "--import", "tsx/esm", "/app/apps/cli/src/bin.ts"]
 CMD ["web", "--no-open"]
