@@ -20,8 +20,8 @@
 ### 从另一台电脑访问
 
 在你自己的 Compose 文件中配置如下（`192.168.3.2` 仅为示例，请替换成实际地址）。
-通过 `--patch /app/docker-web.patch.yml` 让容器监听所有网卡，用普通 Docker
-bridge 端口映射到地址，并用 `--trusted-host` 显式信任浏览器访问地址。
+通过 `--host 0.0.0.0` 让容器监听所有网卡，用普通 Docker
+bridge 端口映射，并用 `--trusted-host` 显式信任浏览器访问地址。
 不要同时使用 `network_mode: host`。
 
 ```yaml
@@ -33,9 +33,9 @@ services:
       - "192.168.3.2:3080:3080"
     command:
       - web
+      - --host
+      - "0.0.0.0"
       - --no-open
-      - --patch
-      - /app/docker-web.patch.yml
       - --trusted-host
       - "192.168.3.2:3080"
       - "192.168.3.2"
@@ -53,17 +53,18 @@ docker compose logs --tail=100
 ```
 
 从启动日志取出带 token 的 URL，将其中的 `127.0.0.1` 或 `localhost`
-替换为 运行容器的电脑 IP 地址（示例 `192.168.3.2`），保留端口、路径和 token。仅打开根地址可能返回 401。
-该补丁需要包含它的新镜像；旧镜像需先更新。
+替换为运行容器的电脑 IP 地址（示例 `192.168.3.2`），保留端口、路径和 token。仅打开根地址可能返回 401。
+此命令需要使用更新后的镜像。构建时只移除上游 CLI 对 `--host 0.0.0.0`
+的拦截，Web 服务本身已支持该地址。若上游拦截代码改变，构建会报错以便复核。
 `DSH_TRUSTED_HOSTS` 环境变量不会由本镜像转换成启动参数，此示例直接传
 `--trusted-host`。如需公网访问，应使用带访问认证的 HTTPS 反向代理。
 
 ### 在运行容器的电脑上访问
 
-Web 服务只监听容器内 loopback（上游禁止 `--host 0.0.0.0`），所以要用 host 网络：
+镜像默认监听 `0.0.0.0:3080`，本机访问时将端口发布到宿主机 loopback：
 
 ```sh
-docker run --rm --network host \
+docker run --rm -p 127.0.0.1:3080:3080 \
   -e DEEPSEEK_API_KEY=sk-... \
   -e DSH_HOME=/data \
   -v /your/host/dsh-home:/data \
@@ -74,7 +75,7 @@ docker run --rm --network host \
 然后浏览器打开启动日志里打印的 `dsh web:` URL。
 
 > `docker run` 里的 `web` 是 `--profile web` 的官方简写；默认端口 **3080**。
-> 想换端口就整体覆盖默认命令：`... dsh-docker web --no-open --port 8080`
+> 想换端口就整体覆盖默认命令：`... dsh-docker web --host 0.0.0.0 --no-open --port 8080`
 > （同时 `-e DSH_PORT=8080`，否则容器 `HEALTHCHECK` 会一直探 3080、显示 unhealthy）。
 
 ### dsh-home 与 workspace 是两码事，都可以放到容器外面
@@ -114,7 +115,7 @@ Actions 只负责拉取上游、构建镜像并发布到 GHCR，不启动容器�
 
 - 镜像较大（保留了完整源码 + node_modules，因为 `dsh` 走 tsx 源码执行）。
   后续可用 `pnpm deploy`、剔除 desktop/benchmark 依赖、删除 `.git` 来瘦身。
-- 默认只监听 loopback；局域网访问使用上面的配置补丁和端口映射。
+- 默认监听容器所有网卡，宿主机上的可访问地址由 Docker 端口映射决定。
 - 定时任务在仓库 60 天无活动后会被 GitHub 自动停用；可加一个 keep-alive。
 
 ## 保留策略（只留最近一周）

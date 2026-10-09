@@ -5,7 +5,7 @@
 # image that boots the Web profile.
 #
 #   docker build -t dsh-docker --build-arg DSH_REF=<branch|tag|sha> .
-#   docker run --rm --network host -v "$PWD/dsh-home:/data" -v "$PWD/projects:/workspace" ghcr.io/<owner>/dsh-docker
+#   docker run --rm -p 127.0.0.1:3080:3080 -v "$PWD/dsh-home:/data" -v "$PWD/projects:/workspace" ghcr.io/<owner>/dsh-docker
 
 # ---------------------------------------------------------------------------
 # Stage 1 — builder
@@ -28,6 +28,20 @@ RUN set -eux; \
     git remote add origin "${DSH_REPOSITORY}"; \
     git fetch --depth 1 origin "${DSH_REF}"; \
     git checkout -q --detach FETCH_HEAD
+
+# The webserver supports all-interface binding, but the upstream CLI rejects
+# that address. Container users control exposure through Docker port mapping.
+# Remove only this CLI guard; fail the build if upstream changes its shape.
+RUN node --input-type=module <<'JS'
+import { readFileSync, writeFileSync } from 'node:fs';
+const path = 'packages/bundle/web-app/src/startup.ts';
+const source = readFileSync(path, 'utf8');
+const guard = /    if \(options\.host === '0\.0\.0\.0'\) \{\r?\n      program\.error\('error: --host 0\.0\.0\.0 is intentionally not supported yet for safety: it would expose remote code execution to the network; use 127\.0\.0\.1 instead'\)\r?\n    \}\r?\n/g;
+if ([...source.matchAll(guard)].length !== 1) {
+  throw new Error('Upstream --host guard changed; review the Docker listener patch');
+}
+writeFileSync(path, source.replace(guard, ''));
+JS
 
 # Install the *exact* pnpm the repo pins in its "packageManager" field. This
 # mirrors upstream CI, which lets pnpm/action-setup read the same field. Using
@@ -66,22 +80,6 @@ COPY --from=builder /src /app
 
 WORKDIR /app
 
-# Opt-in Docker bridge listener. CLI --host rejects 0.0.0.0, but the
-# webserver supports it through the upstream configuration patch interface.
-RUN <<'EOF'
-cat > /app/docker-web.patch.yml <<'YAML'
-- id: webserver
-  name: '@deepseek-ai/dsh-host-webserver'
-  inject: [webStartup]
-  config:
-    host: '0.0.0.0'
-    port: !!js ctx.webStartup.port ?? 3080
-    compression: gzip
-    compressionLevel: 1
-    compressionThresholdBytes: 1024
-YAML
-EOF
-
 # DSH_HOME is dsh's state root (credentials, profiles, settings, sessions,
 # attachments). It defaults to ~/.dsh; here it is /data, declared as a volume so
 # you can bind-mount a host directory onto it.
@@ -96,10 +94,7 @@ ENV NARB_DISABLE_NATIVE_CACHE=1
 RUN mkdir -p /data /workspace
 VOLUME ["/data"]
 
-# The web listener always binds loopback inside the container (dsh rejects
-# `--host 0.0.0.0`), on port 3080 by default. Publish it with `--network host`;
-# plain `-p 3080:3080` will NOT work, because docker forwards to the container's
-# eth0 address, not its loopback.
+# Listen on the container interfaces so Docker can publish port 3080.
 EXPOSE 3080
 
 # Readiness probe. Any HTTP response means "up" — the startup URL carries a
@@ -111,4 +106,4 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=90s --retries=3 \
 # `web` is the documented shorthand for `--profile web`; `--no-open` skips the
 # browser handoff (there is none in a container).
 ENTRYPOINT ["tini", "--", "node", "--import", "tsx/esm", "/app/apps/cli/src/bin.ts"]
-CMD ["web", "--no-open"]
+CMD ["web", "--host", "0.0.0.0", "--no-open"]
