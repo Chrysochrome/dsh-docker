@@ -1,0 +1,110 @@
+name: Build dsh image
+
+on:
+  schedule:
+    # 00:00 UTC, every day.
+    - cron: '0 0 * * *'
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'deepseek-harness git ref (branch, tag or commit SHA)'
+        required: false
+        default: master
+        type: string
+      push_image:
+        description: 'Push the image to GHCR (uncheck for a build-only test run)'
+        required: false
+        default: true
+        type: boolean
+  push:
+    branches: [main]
+    paths:
+      - 'Dockerfile'
+      - '.github/workflows/**'
+
+concurrency:
+  group: build-dsh-image
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  UPSTREAM_REPOSITORY: deepseek-ai/deepseek-harness
+  UPSTREAM_URL: https://github.com/deepseek-ai/deepseek-harness.git
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # The build is disk-hungry: drop the preinstalled toolchains first.
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          sudo docker image prune --all --force
+
+      - name: Resolve upstream ref
+        id: upstream
+        env:
+          INPUT_REF: ${{ inputs.ref }}
+        run: |
+          set -euo pipefail
+          ref="${INPUT_REF:-master}"
+          sha="$(curl -fsSL -H 'Accept: application/vnd.github+json' \
+            "https://api.github.com/repos/${UPSTREAM_REPOSITORY}/commits/${ref}" | jq -r '.sha')"
+          echo "ref=${ref}"         >> "$GITHUB_OUTPUT"
+          echo "sha=${sha}"         >> "$GITHUB_OUTPUT"
+          echo "short=${sha:0:7}"   >> "$GITHUB_OUTPUT"
+          echo "Building ${UPSTREAM_REPOSITORY}@${ref} (${sha})"
+
+      - name: Compute image name
+        id: image
+        run: echo "name=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.push_image }}
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute image metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ steps.image.outputs.name }}
+          tags: |
+            type=raw,value=latest
+            type=raw,value={{date 'YYYYMMDD'}}
+            type=raw,value=sha-${{ steps.upstream.outputs.short }}
+          labels: |
+            org.opencontainers.image.title=deepseek-harness
+            org.opencontainers.image.description=DeepSeek Harness, built from source
+            org.opencontainers.image.source=https://github.com/${{ env.UPSTREAM_REPOSITORY }}
+            org.opencontainers.image.revision=${{ steps.upstream.outputs.sha }}
+            org.opencontainers.image.version=${{ steps.upstream.outputs.ref }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          # Schedule / push: always publish. Manual run: only if push_image is checked.
+          push: ${{ github.event_name != 'workflow_dispatch' || inputs.push_image }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            DSH_REPOSITORY=${{ env.UPSTREAM_URL }}
+            DSH_REF=${{ steps.upstream.outputs.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
