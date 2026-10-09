@@ -49,7 +49,7 @@ dsh 区分两个目录，各自都可以用 bind mount 映射到宿主机路径�
 
 ## CI 自检（Smoke test）
 
-每次构建（定时 / 手动 / push）之后，workflow 都会自动**起一次容器**验证运行时，
+每次构建（定时 / 手动 / push）之后，workflow 都会自动**启动容器**验证运行时，
 不需要你本地有 docker：
 
 0. 打印运行时诊断：`process.versions`、`node-addon-require-builtin` 的版本、
@@ -63,6 +63,17 @@ dsh 区分两个目录，各自都可以用 bind mount 映射到宿主机路径�
 3. `curl http://127.0.0.1:3080/`，只要不是 `000`（连不上）就算通过——
    启动 URL 带进程 token，所以 401/403 也算端口正常。
 4. 无论成败都会把容器日志打进 workflow，失败时直接能看见原因。
+
+启动与 HTTP 检查会分别覆盖普通容器，以及只读根文件系统、带 `noexec`
+的 `/tmp` tmpfs、`no-new-privileges` 和 `cap_drop: ALL` 的容器。
+两种环境都通过后才推送 GHCR，失败时不会覆盖已发布的 `latest`。
+
+镜像默认设置 `NARB_DISABLE_NATIVE_CACHE=1`，让原生加载器直接加载 `/app`
+内的预编译绑定。该加载器默认会将 `.node` 复制到 `/tmp` 的缓存再加载；
+如果部署环境对 `/tmp` 设置了 `noexec`，动态链接器无法加载缓存里的绑定。
+这会导致同一镜像在 Actions 启动成功、在部署环境却报
+`No usable native binding found`。社区实现也采用了
+[关闭该缓存的处理](https://github.com/runzhliu/deepseek-harness-docker/blob/main/scripts/dsh-container)。
 
 > 原生绑定 `node-addon-require-builtin` 是个「探测私有 Node/V8 状态，不匹配就
 > fail-closed」的 N-API addon，对运行时环境比较敏感。为此构建里做了两件事：

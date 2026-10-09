@@ -94,17 +94,14 @@ jobs:
             org.opencontainers.image.revision=${{ steps.upstream.outputs.sha }}
             org.opencontainers.image.version=${{ steps.upstream.outputs.ref }}
 
-      - name: Build and push
+      - name: Build candidate image
         uses: docker/build-push-action@v6
         with:
           context: .
           file: ./Dockerfile
-          # Schedule / push: always publish. Manual run: only if push_image is checked.
-          push: ${{ github.event_name != 'workflow_dispatch' || inputs.push_image }}
-          # Load into the local docker daemon only when we did NOT push, so the
-          # smoke test below has an image to run. (`load` and `push` are
-          # mutually exclusive in buildx.)
-          load: ${{ github.event_name == 'workflow_dispatch' && !inputs.push_image }}
+          # Test on the Actions runner before updating any published tags.
+          push: false
+          load: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
@@ -120,11 +117,6 @@ jobs:
         run: |
           set -euo pipefail
           image="${{ steps.image.outputs.name }}:latest"
-
-          # When we pushed, the image is in the registry, not local: pull it.
-          if [ "${{ github.event_name != 'workflow_dispatch' || inputs.push_image }}" = "true" ]; then
-            docker pull "$image"
-          fi
 
           # The native loader swallows the real dlopen/ABI error into a nested
           # `attempts` array, and Node's default inspect collapses it — so print
@@ -149,35 +141,62 @@ jobs:
           docker run --rm "$image" web --help
           echo "::endgroup::"
 
-          docker run -d --name dsh-smoke --network host \
-            -e DSH_HOME=/tmp/dsh-home "$image"
-          cleanup() {
-            echo "::group::container logs"
-            docker logs dsh-smoke 2>&1 || true
+          # Match the deployed read-only filesystem and restricted permissions.
+          for layout in normal hardened; do
+            echo "::group::boot layout: ${layout}"
+            tmp_flags=()
+            if [ "$layout" = "hardened" ]; then
+              tmp_flags=(--read-only --tmpfs /tmp:rw,noexec,nosuid,nodev,size=1g
+                --security-opt no-new-privileges:true --cap-drop ALL)
+            fi
+            docker run -d --name dsh-smoke --network host "${tmp_flags[@]}" \
+              -e DSH_HOME=/tmp/dsh-home "$image"
+            cleanup() {
+              echo "::group::container logs"
+              docker logs dsh-smoke 2>&1 || true
+              echo "::endgroup::"
+              docker rm -f dsh-smoke >/dev/null 2>&1 || true
+            }
+            trap cleanup EXIT
+
+            # The documented readiness signal is the `dsh web:` URL line.
+            ready=""
+            for i in $(seq 1 60); do
+              if docker logs dsh-smoke 2>&1 | grep -q 'dsh web:'; then
+                ready=1; echo "readiness line after ~$((i * 5))s"; break
+              fi
+              running="$(docker inspect -f '{{.State.Running}}' dsh-smoke 2>/dev/null || echo false)"
+              if [ "$running" != "true" ]; then
+                echo "container exited before becoming ready"; break
+              fi
+              sleep 5
+            done
+            [ -n "$ready" ] || { echo "::error::web server never reported readiness"; exit 1; }
+
+            # Prove the listener is reachable. Any HTTP status counts; the startup
+            # URL carries a token, so 401/403 still means the port is open.
+            code="$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:3080/ || true)"
+            echo "GET http://127.0.0.1:3080/ -> ${code}"
+            [ "$code" != "000" ] || { echo "::error::nothing listening on 3080"; exit 1; }
+            cleanup
+            trap - EXIT
             echo "::endgroup::"
-            docker rm -f dsh-smoke >/dev/null 2>&1 || true
-          }
-          trap cleanup EXIT
-
-          # The documented readiness signal is the `dsh web:` URL line.
-          ready=""
-          for i in $(seq 1 60); do
-            if docker logs dsh-smoke 2>&1 | grep -q 'dsh web:'; then
-              ready=1; echo "readiness line after ~$((i * 5))s"; break
-            fi
-            running="$(docker inspect -f '{{.State.Running}}' dsh-smoke 2>/dev/null || echo false)"
-            if [ "$running" != "true" ]; then
-              echo "container exited before becoming ready"; break
-            fi
-            sleep 5
           done
-          [ -n "$ready" ] || { echo "::error::web server never reported readiness"; exit 1; }
 
-          # Prove the listener is reachable. Any HTTP status counts; the startup
-          # URL carries a token, so 401/403 still means the port is open.
-          code="$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:3080/ || true)"
-          echo "GET http://127.0.0.1:3080/ -> ${code}"
-          [ "$code" != "000" ] || { echo "::error::nothing listening on 3080"; exit 1; }
+      - name: Publish verified image
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.push_image }}
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            DSH_REPOSITORY=${{ env.UPSTREAM_URL }}
+            DSH_REF=${{ steps.upstream.outputs.sha }}
+          # Reuse the candidate build in this same Buildx builder.
+          cache-from: type=gha
 
       # Retention: drop everything older than a week so the registry does not
       # grow without bound. Only runs when an image was actually pushed, so

@@ -70,6 +70,10 @@ WORKDIR /app
 # attachments). It defaults to ~/.dsh; here it is /data, declared as a volume so
 # you can bind-mount a host directory onto it.
 ENV DSH_HOME=/data
+# The addon otherwise copies its binding to /tmp before dlopen(). A host may
+# mount /tmp with noexec, which prevents loading that cached shared object.
+# Load the installed, immutable prebuild directly from /app instead.
+ENV NARB_DISABLE_NATIVE_CACHE=1
 # The agent *workspace* is separate from DSH_HOME and is chosen in the Web UI.
 # Bind-mount one in (e.g. -v /host/projects:/workspace) and add it in the UI.
 # Keep the process rooted at /app so `tsx` resolves from /app/node_modules.
