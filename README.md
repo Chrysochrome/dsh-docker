@@ -53,7 +53,8 @@ dsh 区分两个目录，各自都可以用 bind mount 映射到宿主机路径�
 不需要你本地有 docker：
 
 0. 打印运行时诊断：`process.versions`、`node-addon-require-builtin` 的版本、
-   预编译 `.node` 是否存在、它的 `ldd` 依赖，以及 `require()` 的**完整**错误
+   预编译 `.node` 是否存在、它的 `ldd` 依赖，以及从实际消费者 `vendor/loader`
+   解析依赖时 `require()` 的**完整**错误（避免 pnpm 下从根目录加载不到间接依赖）
    （原生加载器会把真正的 dlopen/ABI 错误藏进嵌套的 `attempts`，默认会被折叠掉）。
 1. `dsh web --help` — 验证镜像能启动、`tsx` 能从 `/app/node_modules` 正确解析、
    CLI 与 web 插件能加载（`--help` 只打印帮助、不真正 bind）。
@@ -68,6 +69,12 @@ dsh 区分两个目录，各自都可以用 bind mount 映射到宿主机路径�
 > 用上游 `package.json` 的 `packageManager` 里锁定的 **pnpm 版本**（而不是写死一个
 > 可能与仓库不兼容的旧版本）；并在 runtime 镜像里显式安装 **`libstdc++6`**
 > （该 addon 要求 `GLIBCXX_3.4.25` 及以上的 C++ 运行时）。
+
+> 如果仍报 `No usable native binding found`，请查看 Actions 的
+> `native binding diagnostics` 分组中最内层 `attempts` 的 `message`。
+> 平台包已安装但加载失败时，后续 `build/nodeabi`、`build/napi` 的
+> `MODULE_NOT_FOUND` 只是本地备用产物不存在，不是预编译绑定失败的根因。
+> 发布的 addon 不包含原生源码，不能靠 `pnpm rebuild` 补出这些产物。
 
 
 手动跑一次 `workflow_dispatch`、把 `push_image` 取消勾选，就是「只构建 + 自检、不推包」。

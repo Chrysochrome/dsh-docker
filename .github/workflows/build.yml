@@ -140,8 +140,8 @@ jobs:
             echo "== prebuilds.json =="; cat "${root}/prebuilds.json" 2>&1 || true
             echo "== prebuilt dir =="; ls -l "${root}/prebuilt" 2>&1 || true
             echo "== ldd =="; for f in "${root}"/prebuilt/*.node; do echo "-- $f"; ldd "$f" 2>&1 || true; done
-            echo "== direct require (full error, depth 12) =="
-            node -e "const u=require(\"util\");try{require(\"node-addon-require-builtin\");console.log(\"binding OK\")}catch(e){console.log(u.inspect(e,{depth:12}))}"
+            echo "== require from vendor/loader (full error) =="
+            node -e "const u=require(\"node:util\");const r=require(\"node:module\").createRequire(\"/app/vendor/loader/package.json\");try{console.log(\"resolved:\",r.resolve(\"node-addon-require-builtin\"));const addon=r(\"node-addon-require-builtin\");console.log(addon.getBindingInfo())}catch(e){console.error(u.inspect(e,{depth:null,maxArrayLength:null,maxStringLength:null,colors:false}));process.exitCode=1}"
           ' || true
           echo "::endgroup::"
 
