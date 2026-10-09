@@ -52,6 +52,9 @@ dsh 区分两个目录，各自都可以用 bind mount 映射到宿主机路径�
 每次构建（定时 / 手动 / push）之后，workflow 都会自动**起一次容器**验证运行时，
 不需要你本地有 docker：
 
+0. 打印运行时诊断：`process.versions`、`node-addon-require-builtin` 的版本、
+   预编译 `.node` 是否存在、它的 `ldd` 依赖，以及 `require()` 的**完整**错误
+   （原生加载器会把真正的 dlopen/ABI 错误藏进嵌套的 `attempts`，默认会被折叠掉）。
 1. `dsh web --help` — 验证镜像能启动、`tsx` 能从 `/app/node_modules` 正确解析、
    CLI 与 web 插件能加载（`--help` 只打印帮助、不真正 bind）。
 2. 分离模式启动 `web --no-open`，轮询日志等待上游文档定义的 readiness 信号
@@ -59,6 +62,13 @@ dsh 区分两个目录，各自都可以用 bind mount 映射到宿主机路径�
 3. `curl http://127.0.0.1:3080/`，只要不是 `000`（连不上）就算通过——
    启动 URL 带进程 token，所以 401/403 也算端口正常。
 4. 无论成败都会把容器日志打进 workflow，失败时直接能看见原因。
+
+> 原生绑定 `node-addon-require-builtin` 是个「探测私有 Node/V8 状态，不匹配就
+> fail-closed」的 N-API addon，对运行时环境比较敏感。为此构建里做了两件事：
+> 用上游 `package.json` 的 `packageManager` 里锁定的 **pnpm 版本**（而不是写死一个
+> 可能与仓库不兼容的旧版本）；并在 runtime 镜像里显式安装 **`libstdc++6`**
+> （该 addon 要求 `GLIBCXX_3.4.25` 及以上的 C++ 运行时）。
+
 
 手动跑一次 `workflow_dispatch`、把 `push_image` 取消勾选，就是「只构建 + 自检、不推包」。
 

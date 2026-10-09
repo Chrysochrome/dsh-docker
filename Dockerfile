@@ -17,12 +17,7 @@ FROM node:24-bookworm AS builder
 ARG DSH_REPOSITORY=https://github.com/deepseek-ai/deepseek-harness.git
 ARG DSH_REF=master
 
-ENV CI=1 \
-    PNPM_HOME=/pnpm \
-    PATH=/pnpm:$PATH
-
-# package.json pins "packageManager": "pnpm@11.7.0".
-RUN npm install --global pnpm@11.7.0 && pnpm --version
+ENV CI=1
 
 WORKDIR /src
 
@@ -33,6 +28,17 @@ RUN set -eux; \
     git remote add origin "${DSH_REPOSITORY}"; \
     git fetch --depth 1 origin "${DSH_REF}"; \
     git checkout -q --detach FETCH_HEAD
+
+# Install the *exact* pnpm the repo pins in its "packageManager" field. This
+# mirrors upstream CI, which lets pnpm/action-setup read the same field. Using
+# the pinned version matters: the workspace uses version-sensitive config
+# (allowBuilds, minimumReleaseAge/minimumReleaseAgeExclude, lockfile format)
+# that older pnpm releases do not understand.
+RUN set -eux; \
+    version="$(node -p "require('./package.json').packageManager.replace(/^pnpm@/, '').split('+')[0]")"; \
+    echo "installing pnpm@${version} (from package.json packageManager)"; \
+    npm install --global "pnpm@${version}"; \
+    pnpm --version
 
 # BuildKit cache mount so daily rebuilds reuse the pnpm store.
 RUN --mount=type=cache,id=pnpm-store,target=/pnpm/store \
@@ -46,8 +52,12 @@ RUN pnpm run build:official
 # ---------------------------------------------------------------------------
 FROM node:24-bookworm-slim AS runtime
 
+# libstdc++6: the prebuilt `node-addon-require-builtin` binding is a C++ addon
+# whose release pipeline verifies a `GLIBCXX_3.4.25` floor and a declared
+# `libstdc++.so.6` dependency. The slim image keeps it only because Node itself
+# links it, so install it explicitly rather than relying on that.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates git tini \
+    && apt-get install -y --no-install-recommends ca-certificates git tini libstdc++6 \
     && rm -rf /var/lib/apt/lists/*
 
 # Keep the whole prepared workspace: the CLI runs the TypeScript entry through

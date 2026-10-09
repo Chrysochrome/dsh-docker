@@ -113,9 +113,9 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      # Verify the built image actually boots, so entrypoint / tsx-resolution
-      # regressions surface here instead of on your machine. Uses `--network
-      # host` because dsh refuses to bind a non-loopback host.
+      # Verify the built image actually boots, so entrypoint / tsx-resolution /
+      # native-binding regressions surface here instead of on your machine.
+      # Uses `--network host` because dsh refuses to bind a non-loopback host.
       - name: Smoke test (boot + HTTP)
         run: |
           set -euo pipefail
@@ -125,6 +125,25 @@ jobs:
           if [ "${{ github.event_name != 'workflow_dispatch' || inputs.push_image }}" = "true" ]; then
             docker pull "$image"
           fi
+
+          # The native loader swallows the real dlopen/ABI error into a nested
+          # `attempts` array, and Node's default inspect collapses it — so print
+          # the environment, the shipped binary, its dynamic deps and the FULL
+          # error verbatim. Best-effort: never fail the step on this alone.
+          echo "::group::native binding diagnostics"
+          docker run --rm --entrypoint sh "$image" -c '
+            echo "== process.versions =="; node -p "process.versions"
+            pkg="$(find /app/node_modules/.pnpm -maxdepth 1 -type d -name "node-addon-require-builtin-linux-x64-gnu@*" 2>/dev/null | head -n1)"
+            echo "== platform package: ${pkg} =="
+            root="${pkg}/node_modules/node-addon-require-builtin-linux-x64-gnu"
+            echo "== installed addon version =="; grep -m1 "\"version\"" "${root}/package.json" 2>&1 || true
+            echo "== prebuilds.json =="; cat "${root}/prebuilds.json" 2>&1 || true
+            echo "== prebuilt dir =="; ls -l "${root}/prebuilt" 2>&1 || true
+            echo "== ldd =="; for f in "${root}"/prebuilt/*.node; do echo "-- $f"; ldd "$f" 2>&1 || true; done
+            echo "== direct require (full error, depth 12) =="
+            node -e "const u=require(\"util\");try{require(\"node-addon-require-builtin\");console.log(\"binding OK\")}catch(e){console.log(u.inspect(e,{depth:12}))}"
+          ' || true
+          echo "::endgroup::"
 
           echo "::group::dsh web --help"
           docker run --rm "$image" web --help
