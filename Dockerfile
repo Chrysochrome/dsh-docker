@@ -29,18 +29,32 @@ RUN set -eux; \
     git fetch --depth 1 origin "${DSH_REF}"; \
     git checkout -q --detach FETCH_HEAD
 
-# The webserver supports all-interface binding, but the upstream CLI rejects
-# that address. Container users control exposure through Docker port mapping.
-# Remove only this CLI guard; fail the build if upstream changes its shape.
+# Allow the container's IPv4 wildcard listener in the upstream CLI and,
+# on newer revisions, the webserver schema. Keep other address checks intact.
 RUN node --input-type=module <<'JS'
 import { readFileSync, writeFileSync } from 'node:fs';
-const path = 'packages/bundle/web-app/src/startup.ts';
-const source = readFileSync(path, 'utf8');
-const guard = /    if \(options\.host === '0\.0\.0\.0'\) \{\r?\n      program\.error\('error: --host 0\.0\.0\.0 is intentionally not supported yet for safety: it would expose remote code execution to the network; use 127\.0\.0\.1 instead'\)\r?\n    \}\r?\n/g;
-if ([...source.matchAll(guard)].length !== 1) {
-  throw new Error('Upstream --host guard changed; review the Docker listener patch');
+function replaceOnce(source, before, after, path) {
+  if (source.split(before).length !== 2) {
+    throw new Error(`Expected one listener check in ${path}: ${before}`);
+  }
+  return source.replace(before, after);
 }
-writeFileSync(path, source.replace(guard, ''));
+const cliPath = 'packages/bundle/web-app/src/startup.ts';
+let cli = readFileSync(cliPath, 'utf8');
+const currentCheck = 'options.host !== undefined && isWildcardHost(options.host)';
+const oldCheck = "options.host === '0.0.0.0'";
+if (cli.includes(currentCheck)) {
+  cli = replaceOnce(cli, currentCheck,
+    "options.host !== undefined && options.host !== '0.0.0.0' && isWildcardHost(options.host)", cliPath);
+  const serverPath = 'packages/host/webserver/src/index.ts';
+  const server = readFileSync(serverPath, 'utf8');
+  writeFileSync(serverPath, replaceOnce(server,
+    'if (isWildcardAddress(parsed)) {',
+    "if (value !== '0.0.0.0' && isWildcardAddress(parsed)) {", serverPath));
+} else {
+  cli = replaceOnce(cli, oldCheck, 'false', cliPath);
+}
+writeFileSync(cliPath, cli);
 JS
 
 # Install the *exact* pnpm the repo pins in its "packageManager" field. This
