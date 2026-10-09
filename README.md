@@ -17,6 +17,49 @@
 
 ## 使用
 
+### 从另一台电脑访问
+
+在你自己的 Compose 文件中配置如下（`192.168.3.2` 仅为示例，请替换成实际地址）。
+通过 `--patch /app/docker-web.patch.yml` 让容器监听所有网卡，用普通 Docker
+bridge 端口映射到地址，并用 `--trusted-host` 显式信任浏览器访问地址。
+不要同时使用 `network_mode: host`。
+
+```yaml
+services:
+  deepseek-harness:
+    image: ghcr.io/<owner>/dsh-docker:latest
+    restart: unless-stopped
+    ports:
+      - "192.168.3.2:3080:3080"
+    command:
+      - web
+      - --no-open
+      - --patch
+      - /app/docker-web.patch.yml
+      - --trusted-host
+      - "192.168.3.2:3080"
+      - "192.168.3.2"
+    volumes:
+      - /your/host/dsh-home:/data
+      - /your/host/projects:/workspace
+```
+
+保留你已有的环境变量、只读文件系统和 tmpfs 等配置。更新镜像并重新创建容器：
+
+```sh
+docker compose pull
+docker compose up -d --force-recreate
+docker compose logs --tail=100
+```
+
+从启动日志取出带 token 的 URL，将其中的 `127.0.0.1` 或 `localhost`
+替换为 运行容器的电脑 IP 地址（示例 `192.168.3.2`），保留端口、路径和 token。仅打开根地址可能返回 401。
+该补丁需要包含它的新镜像；旧镜像需先更新。
+`DSH_TRUSTED_HOSTS` 环境变量不会由本镜像转换成启动参数，此示例直接传
+`--trusted-host`。如需公网访问，应使用带访问认证的 HTTPS 反向代理。
+
+### 在运行容器的电脑上访问
+
 Web 服务只监听容器内 loopback（上游禁止 `--host 0.0.0.0`），所以要用 host 网络：
 
 ```sh
@@ -47,26 +90,12 @@ dsh 区分两个目录，各自都可以用 bind mount 映射到宿主机路径�
 > 1. 进程固定从 `/app` 启动（`tsx` 需要从 `/app/node_modules` 解析），所以**不要**用 `-w` 改工作目录，workspace 请在 Web UI 里添加。
 > 2. 新开的 Web UI 默认没有任何 workspace，必须先手动加一个。
 
-## CI 自检（Smoke test）
+## 构建与发布
 
-每次构建（定时 / 手动 / push）之后，workflow 都会自动**启动容器**验证运行时，
-不需要你本地有 docker：
+Actions 只负责拉取上游、构建镜像并发布到 GHCR，不启动容器或执行运行时测试。
+运行验证由使用者在部署机器上手动进行。
 
-0. 打印运行时诊断：`process.versions`、`node-addon-require-builtin` 的版本、
-   预编译 `.node` 是否存在、它的 `ldd` 依赖，以及从实际消费者 `vendor/loader`
-   解析依赖时 `require()` 的**完整**错误（避免 pnpm 下从根目录加载不到间接依赖）
-   （原生加载器会把真正的 dlopen/ABI 错误藏进嵌套的 `attempts`，默认会被折叠掉）。
-1. `dsh web --help` — 验证镜像能启动、`tsx` 能从 `/app/node_modules` 正确解析、
-   CLI 与 web 插件能加载（`--help` 只打印帮助、不真正 bind）。
-2. 分离模式启动 `web --no-open`，轮询日志等待上游文档定义的 readiness 信号
-   `dsh web:` 行出现（最多 ~5 分钟）。
-3. `curl http://127.0.0.1:3080/`，只要不是 `000`（连不上）就算通过——
-   启动 URL 带进程 token，所以 401/403 也算端口正常。
-4. 无论成败都会把容器日志打进 workflow，失败时直接能看见原因。
-
-启动与 HTTP 检查会分别覆盖普通容器，以及只读根文件系统、带 `noexec`
-的 `/tmp` tmpfs、`no-new-privileges` 和 `cap_drop: ALL` 的容器。
-两种环境都通过后才推送 GHCR，失败时不会覆盖已发布的 `latest`。
+手动运行 `workflow_dispatch` 时取消勾选 `push_image`，即可只构建、不推送。
 
 镜像默认设置 `NARB_DISABLE_NATIVE_CACHE=1`，让原生加载器直接加载 `/app`
 内的预编译绑定。该加载器默认会将 `.node` 复制到 `/tmp` 的缓存再加载；
@@ -81,21 +110,11 @@ dsh 区分两个目录，各自都可以用 bind mount 映射到宿主机路径�
 > 可能与仓库不兼容的旧版本）；并在 runtime 镜像里显式安装 **`libstdc++6`**
 > （该 addon 要求 `GLIBCXX_3.4.25` 及以上的 C++ 运行时）。
 
-> 如果仍报 `No usable native binding found`，请查看 Actions 的
-> `native binding diagnostics` 分组中最内层 `attempts` 的 `message`。
-> 平台包已安装但加载失败时，后续 `build/nodeabi`、`build/napi` 的
-> `MODULE_NOT_FOUND` 只是本地备用产物不存在，不是预编译绑定失败的根因。
-> 发布的 addon 不包含原生源码，不能靠 `pnpm rebuild` 补出这些产物。
-
-
-手动跑一次 `workflow_dispatch`、把 `push_image` 取消勾选，就是「只构建 + 自检、不推包」。
-
 ## 已知限制 / 后续可优化
 
 - 镜像较大（保留了完整源码 + node_modules，因为 `dsh` 走 tsx 源码执行）。
   后续可用 `pnpm deploy`、剔除 desktop/benchmark 依赖、删除 `.git` 来瘦身。
-- 只监听 loopback：跨机访问需要 `--network host`，或在同 netns 里放反向代理 +
-  `--trusted-host`。
+- 默认只监听 loopback；局域网访问使用上面的配置补丁和端口映射。
 - 定时任务在仓库 60 天无活动后会被 GitHub 自动停用；可加一个 keep-alive。
 
 ## 保留策略（只留最近一周）
